@@ -2,13 +2,17 @@
 """
 mkbang — ArchBang/FruitBang ISO builder
 Replaces mkarchiso for the ArchBang/FruitBang use case.
+
 Supported boot modes: bios.syslinux, uefi.systemd-boot, uefi.grub
 Rootfs image type:    squashfs only
 Build mode:           iso only (no netboot, no bootstrap, no signing)
+
 Profile layout is fully compatible with existing archbang profiledef.sh,
 packages.x86_64, airootfs/, syslinux/, efiboot/, grub/ directories.
 """
+
 import argparse
+import json
 import math
 import os
 import re
@@ -20,6 +24,7 @@ from pathlib import Path
 
 APP_NAME = "mkbang"
 
+# Microcode images to carry alongside the initramfs when needed
 UCODES = [
     "intel-uc.img", "intel-ucode.img",
     "amd-uc.img",   "amd-ucode.img",
@@ -27,22 +32,1105 @@ UCODES = [
 ]
 
 
-def info(msg):
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+def info(msg: str) -> None:
     print(f"[{APP_NAME}] INFO: {msg}", flush=True)
 
-def warning(msg):
+def warning(msg: str) -> None:
     print(f"[{APP_NAME}] WARNING: {msg}", file=sys.stderr, flush=True)
 
-def die(msg, code=1):
+def die(msg: str, code: int = 1) -> None:
     print(f"[{APP_NAME}] ERROR: {msg}", file=sys.stderr, flush=True)
     sys.exit(code)
 
-def run(cmd, check=True, capture=False, cwd=None):
+
+# ---------------------------------------------------------------------------
+# Subprocess helper
+# ---------------------------------------------------------------------------
+
+def run(cmd, check=True, capture=False, cwd=None, extra_env=None):
+    """Run a command, optionally capturing output. Dies on failure."""
     env = {k: v for k, v in os.environ.items() if k != "TMPDIR"}
+    if extra_env:
+        env.update(extra_env)
     kwargs = dict(env=env, cwd=cwd)
     if capture:
         kwargs.update(capture_output=True, text=True)
     result = subprocess.run([str(c) for c in cmd], **kwargs)
     if check and result.returncode != 0:
-        die(f"Command failed: {' '.join(str(c) for c in cmd)}")
+        die(f"Command failed (exit {result.returncode}): {' '.join(str(c) for c in cmd)}")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Profile reader
+# ---------------------------------------------------------------------------
+
+def _read_profile(profile: Path) -> dict:
+    """
+    Source profiledef.sh via bash and extract all relevant variables,
+    including bash arrays and associative arrays.
+    Returns a plain dict with everything normalised to Python types.
+    """
+    profiledef = profile / "profiledef.sh"
+    if not profiledef.exists():
+        die(f"Profile '{profile}' is missing profiledef.sh!")
+
+    # We emit each variable as a JSON fragment so we can parse it cleanly.
+    dump_script = r"""
+source "{profiledef}"
+
+emit() {
+    local key="$1"; shift
+    printf '%s\n' "$key"
+    printf '%s\n' "$@"
+    printf '__END__\n'
+}
+
+emit iso_name         "${iso_name:-}"
+emit iso_label        "${iso_label:-}"
+emit iso_publisher    "${iso_publisher:-}"
+emit iso_application  "${iso_application:-}"
+emit iso_version      "${iso_version:-}"
+emit install_dir      "${install_dir:-}"
+emit arch             "${arch:-}"
+emit pacman_conf      "${pacman_conf:-}"
+emit airootfs_image_type "${airootfs_image_type:-squashfs}"
+emit bootmodes        "${bootmodes[@]:-}"
+emit airootfs_image_tool_options "${airootfs_image_tool_options[@]:-}"
+
+# File permissions — emit as key=value pairs
+for k in "${!file_permissions[@]}"; do
+    printf 'FILEPERM\t%s\t%s\n' "$k" "${file_permissions[$k]}"
+done
+printf 'FILEPERM_END\n'
+""".replace("{profiledef}", str(profiledef))
+
+    result = run(
+        ["bash", "-c", dump_script],
+        capture=True, cwd=str(profile)
+    )
+    if result.returncode != 0:
+        die(f"Failed to source profiledef.sh:\n{result.stderr}")
+
+    lines = result.stdout.splitlines()
+    vars_ = {}
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        if line == "FILEPERM_END":
+            break
+
+        if line.startswith("FILEPERM\t"):
+            _, key, val = line.split("\t", 2)
+            vars_.setdefault("file_permissions", {})[key] = val
+            i += 1
+            continue
+
+        # key line followed by values until __END__
+        key = line
+        values = []
+        i += 1
+        while i < len(lines) and lines[i] != "__END__":
+            values.append(lines[i])
+            i += 1
+        i += 1  # skip __END__
+
+        if key in ("bootmodes", "airootfs_image_tool_options"):
+            # multi-word bash arrays arrive as a single space-joined string
+            vars_[key] = values[0].split() if values and values[0] else []
+        else:
+            vars_[key] = values[0] if values else ""
+
+    # Resolve pacman_conf path relative to the profile directory
+    raw_conf = vars_.get("pacman_conf", "")
+    if raw_conf:
+        candidate = profile / raw_conf
+        vars_["pacman_conf"] = str(
+            candidate.resolve() if candidate.exists() else Path(raw_conf).resolve()
+        )
+    else:
+        vars_["pacman_conf"] = "/etc/pacman.conf"
+
+    vars_.setdefault("arch", "x86_64")
+    vars_.setdefault("install_dir", APP_NAME)
+    vars_.setdefault("airootfs_image_type", "squashfs")
+    vars_.setdefault("bootmodes", ["bios.syslinux", "uefi.systemd-boot"])
+    vars_.setdefault("airootfs_image_tool_options", [])
+    vars_.setdefault("file_permissions", {})
+
+    return vars_
+
+
+# ---------------------------------------------------------------------------
+# ISO builder
+# ---------------------------------------------------------------------------
+
+class ISOBuilder:
+    def __init__(
+        self,
+        profile=".",
+        work_dir="./work",
+        out_dir="./out",
+        verbose=True,
+        rm_work_dir=False,
+    ):
+        self.profile    = Path(profile).resolve()
+        self.work_dir   = Path(work_dir).resolve()
+        self.out_dir    = Path(out_dir).resolve()
+        self.verbose    = verbose
+        self.rm_work_dir = rm_work_dir
+
+        # Source the profile
+        pv = _read_profile(self.profile)
+
+        self.iso_name        = pv.get("iso_name", APP_NAME)
+        self.iso_label       = pv.get("iso_label",       APP_NAME.upper())
+        self.iso_publisher   = pv.get("iso_publisher",   APP_NAME)
+        self.iso_application = pv.get("iso_application", f"{APP_NAME} iso")
+        self.iso_version     = pv.get("iso_version", "")
+        self.install_dir     = pv.get("install_dir", APP_NAME)
+        self.arch            = pv.get("arch", "x86_64")
+        self.pacman_conf     = Path(pv["pacman_conf"])
+        self.airootfs_image_type = pv.get("airootfs_image_type", "squashfs")
+        self.bootmodes       = pv.get("bootmodes", ["bios.syslinux", "uefi.systemd-boot"])
+        self.sfs_tool_opts   = pv.get("airootfs_image_tool_options", [])
+        self.file_permissions = pv.get("file_permissions", {})
+
+        if self.airootfs_image_type != "squashfs":
+            die(f"Unsupported airootfs_image_type '{self.airootfs_image_type}'. "
+                "This builder supports squashfs only.")
+
+        # Reproducibility
+        self.source_date_epoch = int(
+            os.environ.get("SOURCE_DATE_EPOCH", int(time.time()))
+        )
+        self.iso_uuid = time.strftime(
+            "%F-%H-%M-%S-00", time.gmtime(self.source_date_epoch)
+        )
+        self.search_filename = f"/boot/{self.iso_uuid}.uuid"
+        self.image_name = f"{self.iso_name}-{self.iso_version}.iso"
+
+        # Key paths (set here so they're valid even when _run_once skips a stage)
+        self.pacstrap_dir    = self.work_dir / self.arch / "airootfs"
+        self.isofs_dir       = self.work_dir / "iso"
+        self.efibootimg      = self.work_dir / "efiboot.img"
+        self.work_pacman_conf = self.work_dir / "iso.pacman.conf"
+
+        self.need_external_ucodes = False
+
+    # ------------------------------------------------------------------
+    # Build entry point
+    # ------------------------------------------------------------------
+
+    def build(self):
+        if os.geteuid() != 0:
+            die("build must be run as root.")
+
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Persist SOURCE_DATE_EPOCH for resumed builds
+        build_date_file = self.work_dir / "build_date"
+        if not build_date_file.exists():
+            build_date_file.write_text(str(self.source_date_epoch) + "\n")
+        else:
+            self.source_date_epoch = int(build_date_file.read_text().strip())
+
+        if self.verbose:
+            self._show_config()
+
+        self._once("make_pacman_conf",       self._make_pacman_conf)
+        self._once("make_custom_airootfs",   self._make_custom_airootfs)
+        self._once("make_packages",          self._make_packages)
+        self._once("make_version",           self._make_version)
+        self._once("make_customize_airootfs",self._make_customize_airootfs)
+        self._once("make_pkglist",           self._make_pkglist)
+        self._once("check_ucode",            self._check_ucode)
+        self._once("make_boot_on_iso9660",   self._make_boot_on_iso9660)
+        self._make_bootmodes()
+        self._once("cleanup_pacstrap",       self._cleanup_pacstrap_dir)
+        self._once("make_squashfs",          self._make_squashfs)
+        self._build_iso_image()
+
+        if self.rm_work_dir:
+            info("Removing working directory...")
+            shutil.rmtree(self.work_dir)
+            info("Done!")
+
+    # ------------------------------------------------------------------
+    # Run-once stamp mechanism — allows resuming interrupted builds
+    # ------------------------------------------------------------------
+
+    def _once(self, name: str, fn):
+        stamp = self.work_dir / f"base.{name}"
+        if not stamp.exists():
+            fn()
+            stamp.touch()
+        else:
+            info(f"Skipping '{name}' (already done).")
+
+    # ------------------------------------------------------------------
+    # Config display
+    # ------------------------------------------------------------------
+
+    def _show_config(self):
+        build_date = time.strftime(
+            "%FT%R%z", time.localtime(self.source_date_epoch)
+        )
+        info("Configuration")
+        info(f"       Architecture : {self.arch}")
+        info(f"    Working directory: {self.work_dir}")
+        info(f"   Install directory : {self.install_dir}")
+        info(f"          Build date : {build_date}")
+        info(f"    Output directory : {self.out_dir}")
+        info(f"         ISO label   : {self.iso_label}")
+        info(f"       ISO publisher : {self.iso_publisher}")
+        info(f"     ISO application : {self.iso_application}")
+        info(f"          Boot modes : {' '.join(self.bootmodes)}")
+        info(f"     Image file name : {self.image_name}")
+        info(f"   Squashfs options  : {' '.join(self.sfs_tool_opts)}")
+
+    # ------------------------------------------------------------------
+    # Stage: pacman.conf
+    # ------------------------------------------------------------------
+
+    def _make_pacman_conf(self):
+        info("Setting up pacman.conf...")
+
+        # Get system-side CacheDirs
+        r = run(["pacman-conf", "CacheDir"], capture=True)
+        sys_cache = r.stdout.strip().replace("\n", " ")
+
+        # Dump profile pacman.conf and strip chroot-hostile directives
+        r = run(
+            ["pacman-conf", "--config", str(self.pacman_conf)],
+            capture=True
+        )
+        conf = r.stdout
+
+        for directive in ("CacheDir", "DBPath", "HookDir", "LogFile", "RootDir"):
+            conf = re.sub(
+                rf"^\s*{directive}\s*=.*\n?", "", conf, flags=re.MULTILINE
+            )
+
+        hook_dir = self.pacstrap_dir / "etc/pacman.d/hooks"
+        conf = conf.replace(
+            "[options]",
+            f"[options]\nCacheDir = {sys_cache}\nHookDir = {hook_dir}"
+        )
+
+        self.work_pacman_conf.write_text(conf)
+        info(f"Written to {self.work_pacman_conf}")
+
+    # ------------------------------------------------------------------
+    # Stage: copy airootfs overlay
+    # ------------------------------------------------------------------
+
+    def _make_custom_airootfs(self):
+        airootfs_src = self.profile / "airootfs"
+        if not airootfs_src.is_dir():
+            info("No airootfs/ overlay in profile, skipping.")
+            return
+
+        info("Copying custom airootfs files...")
+        self.pacstrap_dir.mkdir(parents=True, mode=0o755, exist_ok=True)
+        run([
+            "cp", "-af", "--no-preserve=ownership,mode",
+            f"{airootfs_src}/.", str(self.pacstrap_dir)
+        ])
+
+        for filename, perms in self.file_permissions.items():
+            parts = perms.split(":")
+            if len(parts) != 3:
+                warning(f"Malformed permission entry '{filename}': {perms}")
+                continue
+            owner, group, mode = parts
+            target = self.pacstrap_dir / filename.lstrip("/")
+
+            if not target.exists():
+                warning(f"Cannot set permissions on '{target}': does not exist.")
+                continue
+
+            if filename.endswith("/"):
+                run(["chown", "-fhR", f"{owner}:{group}", str(target)])
+                run(["chmod", "-fR", mode, str(target)])
+            else:
+                run(["chown", "-fh", f"{owner}:{group}", str(target)])
+                run(["chmod", "-f", mode, str(target)])
+
+        info("Done!")
+
+    # ------------------------------------------------------------------
+    # Stage: pacstrap
+    # ------------------------------------------------------------------
+
+    def _make_packages(self):
+        info(f"Installing packages to '{self.pacstrap_dir}'...")
+
+        pkg_file = self.profile / f"packages.{self.arch}"
+        if not pkg_file.exists():
+            pkg_file = self.profile / "packages"
+        if not pkg_file.exists():
+            die(f"No packages file found in '{self.profile}'.")
+
+        lines = pkg_file.read_text().splitlines()
+        pkg_list = [
+            re.sub(r"\s*#.*", "", line).strip()
+            for line in lines
+        ]
+        pkg_list = [p for p in pkg_list if p]
+
+        if not pkg_list:
+            die(f"No packages listed in '{pkg_file}'.")
+
+        self.pacstrap_dir.mkdir(parents=True, exist_ok=True)
+        run([
+            "pacstrap",
+            "-C", str(self.work_pacman_conf),
+            "-c", "-G", "-M", "--",
+            str(self.pacstrap_dir),
+        ] + pkg_list)
+
+        info("Done! Packages installed successfully.")
+
+    # ------------------------------------------------------------------
+    # Stage: version files
+    # ------------------------------------------------------------------
+
+    def _make_version(self):
+        info("Creating version files...")
+
+        # Version in chroot
+        (self.pacstrap_dir / "version").write_text(self.iso_version + "\n")
+
+        # Version on ISO 9660
+        iso_id = self.isofs_dir / self.install_dir
+        iso_id.mkdir(parents=True, exist_ok=True)
+        (iso_id / "version").write_text(self.iso_version + "\n")
+
+        # grubenv on ISO 9660
+        (iso_id / "grubenv").write_text(self._grubenv_block())
+
+        # GRUB search file (GRUB looks for this to locate the ISO volume)
+        search_path = self.isofs_dir / self.search_filename.lstrip("/")
+        search_path.parent.mkdir(parents=True, exist_ok=True)
+        search_path.touch()
+
+        # Patch os-release
+        for candidate in (
+            self.pacstrap_dir / "etc/os-release",
+            self.pacstrap_dir / "usr/lib/os-release",
+        ):
+            if candidate.exists():
+                text = candidate.read_text()
+                text = re.sub(r"^IMAGE_ID=.*\n?", "", text, flags=re.MULTILINE)
+                text = re.sub(r"^IMAGE_VERSION=.*\n?", "", text, flags=re.MULTILINE)
+                text += f"\nIMAGE_ID={self.iso_name}\nIMAGE_VERSION={self.iso_version}\n"
+                candidate.write_text(text)
+                break
+
+        # clock-epoch hint for systems with bad RTC
+        clock_epoch = self.pacstrap_dir / "usr/lib/clock-epoch"
+        clock_epoch.parent.mkdir(parents=True, exist_ok=True)
+        clock_epoch.touch()
+        os.utime(clock_epoch, (self.source_date_epoch, self.source_date_epoch))
+
+        info("Done!")
+
+    def _grubenv_block(self) -> str:
+        """Generate a padded 1024-byte GRUB environment block."""
+        content = (
+            "# GRUB Environment Block\n"
+            f"NAME={self.iso_name}\n"
+            f"VERSION={self.iso_version}\n"
+            f"ARCHISO_LABEL={self.iso_label}\n"
+            f"INSTALL_DIR={self.install_dir}\n"
+            f"ARCH={self.arch}\n"
+            f"ARCHISO_SEARCH_FILENAME={self.search_filename}\n"
+        )
+        padding = "#" * (1024 - len(content))
+        return (content + padding)[:1024]
+
+    # ------------------------------------------------------------------
+    # Stage: customize_airootfs
+    # ------------------------------------------------------------------
+
+    def _chroot(self, *cmd):
+        """Run a command inside the pacstrap chroot."""
+        run(["arch-chroot", str(self.pacstrap_dir)] + list(cmd))
+
+    def _make_customize_airootfs(self):
+        info("Customizing airootfs...")
+        p = self.pacstrap_dir  # shorthand
+
+        # Locale
+        locale_gen = p / "etc/locale.gen"
+        if locale_gen.exists():
+            text = locale_gen.read_text()
+            locale_gen.write_text(text.replace("#en_US.UTF-8", "en_US.UTF-8"))
+        self._chroot("locale-gen")
+        (p / "etc/locale.conf").write_text("LANG=en_US.UTF-8\nLC_COLLATE=C\n")
+
+        # Parallel downloads
+        pacman_conf = p / "etc/pacman.conf"
+        if pacman_conf.exists():
+            pacman_conf.write_text(
+                pacman_conf.read_text().replace("#ParallelDownloads", "ParallelDownloads")
+            )
+
+        # Mirrorlist — uncomment Server lines
+        mirrorlist = p / "etc/pacman.d/mirrorlist"
+        if mirrorlist.exists():
+            mirrorlist.write_text(
+                mirrorlist.read_text().replace("#Server", "Server")
+            )
+
+        # Sudo — allow wheel group without password
+        sudoers = p / "etc/sudoers"
+        if sudoers.exists():
+            sudoers.write_text(
+                sudoers.read_text().replace(
+                    "# %wheel ALL=(ALL:ALL) NOPASSWD: ALL",
+                    "%wheel ALL=(ALL:ALL) NOPASSWD: ALL"
+                )
+            )
+            sudoers.chmod(0o440)
+            shutil.chown(str(sudoers), 0, 0)
+
+        # Hide gparted from application menu
+        gparted_desktop = p / "usr/share/applications/gparted.desktop"
+        if gparted_desktop.exists():
+            text = gparted_desktop.read_text()
+            if "Hidden=true" not in text:
+                text = re.sub(
+                    r"(^Categories=.*$)",
+                    r"\1\nHidden=true",
+                    text, flags=re.MULTILINE
+                )
+                gparted_desktop.write_text(text)
+
+        # Hostname
+        (p / "etc/hostname").write_text("archbang\n")
+
+        # Vconsole
+        (p / "etc/vconsole.conf").write_text("KEYMAP=us\nFONT=Lat2-Terminus16\n")
+
+        # Timezone
+        tz_src = p / "usr/share/zoneinfo/Canada/Montreal"
+        tz_link = p / "etc/localtime"
+        tz_link.unlink(missing_ok=True)
+        tz_link.symlink_to("/usr/share/zoneinfo/Canada/Montreal")
+        self._chroot("hwclock", "--systohc", "--utc")
+
+        # Systemd user services for audio (wireplumber + pipewire)
+        target_dir = p / "etc/skel/.config/systemd/user/default.target.wants"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        unit_src = Path("/usr/lib/systemd/user")
+        for svc in ("wireplumber.service", "pipewire.service", "pipewire-pulse.service"):
+            link = target_dir / svc
+            link.unlink(missing_ok=True)
+            link.symlink_to(f"/usr/lib/systemd/user/{svc}")
+
+        # Live user
+        self._chroot(
+            "useradd", "-m", "-p", "", "-G", "wheel",
+            "-s", "/bin/bash", "-g", "users", "ablive"
+        )
+
+        # System services
+        self._chroot("systemctl", "enable", "pacman-init.service", "NetworkManager.service")
+
+        # dconf database
+        self._chroot("bash", "-c",
+            "command -v dconf &>/dev/null && dconf update || true")
+
+        # Graphical target
+        self._chroot("systemctl", "set-default", "graphical.target")
+
+        info("Done!")
+
+    # ------------------------------------------------------------------
+    # Stage: package list
+    # ------------------------------------------------------------------
+
+    def _make_pkglist(self):
+        info("Creating installed package list...")
+        r = run(
+            ["pacman", "-Q", "--sysroot", str(self.pacstrap_dir)],
+            capture=True
+        )
+        iso_id = self.isofs_dir / self.install_dir
+        iso_id.mkdir(parents=True, exist_ok=True)
+        (iso_id / f"pkglist.{self.arch}.txt").write_text(r.stdout)
+        info("Done!")
+
+    # ------------------------------------------------------------------
+    # Stage: check for microcode in initramfs
+    # ------------------------------------------------------------------
+
+    def _check_ucode(self):
+        for initrd in sorted((self.pacstrap_dir / "boot").glob("initramfs-*.img")):
+            r = run(
+                ["bsdtar", "-tf", str(initrd),
+                 "early_cpio", "kernel/x86/microcode/*.bin"],
+                capture=True, check=False
+            )
+            if r.returncode != 0:
+                self.need_external_ucodes = True
+                info("Initramfs has no embedded microcode; external ucode images will be added.")
+                return
+
+    # ------------------------------------------------------------------
+    # Stage: kernel + initramfs on ISO 9660
+    # ------------------------------------------------------------------
+
+    def _make_boot_on_iso9660(self):
+        info("Copying kernel and initramfs to ISO tree...")
+        boot_dest = self.isofs_dir / self.install_dir / "boot" / self.arch
+        boot_dest.mkdir(parents=True, exist_ok=True)
+
+        boot_src = self.pacstrap_dir / "boot"
+        for initrd in boot_src.glob("initramfs-*.img"):
+            shutil.copy2(initrd, boot_dest)
+        for vmlinuz in boot_src.glob("vmlinuz-*"):
+            shutil.copy2(vmlinuz, boot_dest)
+
+        if self.need_external_ucodes:
+            ucode_dest = self.isofs_dir / self.install_dir / "boot"
+            for ucode in UCODES:
+                src = boot_src / ucode
+                if src.exists():
+                    shutil.copy2(src, ucode_dest)
+
+        info("Done!")
+
+    # ------------------------------------------------------------------
+    # Boot modes
+    # ------------------------------------------------------------------
+
+    def _make_bootmodes(self):
+        for mode in self.bootmodes:
+            stamp = self.work_dir / f"base.bootmode_{mode}"
+            if stamp.exists():
+                info(f"Skipping boot mode '{mode}' (already done).")
+                continue
+            method_name = "_boot_" + mode.replace(".", "_").replace("-", "_")
+            method = getattr(self, method_name, None)
+            if method is None:
+                die(f"Unsupported boot mode: '{mode}'")
+            method()
+            stamp.touch()
+
+    # --- bios.syslinux ---
+
+    def _boot_bios_syslinux(self):
+        info("Setting up SYSLINUX for BIOS booting...")
+
+        syslinux_profile = self.profile / "syslinux"
+        if not syslinux_profile.is_dir():
+            die("Profile syslinux/ directory missing for bios.syslinux boot mode.")
+
+        syslinux_dest = self.isofs_dir / "boot/syslinux"
+        syslinux_dest.mkdir(parents=True, exist_ok=True)
+
+        # Process .cfg files — substitute placeholders
+        for cfg in syslinux_profile.glob("*.cfg"):
+            text = self._substitute(cfg.read_text())
+            (syslinux_dest / cfg.name).write_text(text)
+
+        # Optional splash image
+        splash = syslinux_profile / "splash.png"
+        if splash.exists():
+            shutil.copy2(splash, syslinux_dest)
+
+        # Copy syslinux binaries from the installed chroot
+        syslinux_bios = self.pacstrap_dir / "usr/lib/syslinux/bios"
+        for f in syslinux_bios.glob("*.c32"):
+            shutil.copy2(f, syslinux_dest)
+        for name in ("lpxelinux.0", "memdisk", "isolinux.bin", "isohdpfx.bin"):
+            src = syslinux_bios / name
+            if src.exists():
+                shutil.copy2(src, syslinux_dest)
+
+        # Optional memtest86+
+        memtest = self.pacstrap_dir / "boot/memtest86+/memtest.bin"
+        if memtest.exists():
+            mt_dest = self.isofs_dir / "boot/memtest86+"
+            mt_dest.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(memtest, mt_dest / "memtest")
+
+        info("Done! SYSLINUX set up for BIOS booting.")
+
+    # --- uefi.systemd-boot ---
+
+    def _boot_uefi_systemd_boot(self):
+        info("Setting up systemd-boot for UEFI booting...")
+
+        efiboot_profile = self.profile / "efiboot"
+        loader_conf    = efiboot_profile / "loader/loader.conf"
+        entries_dir    = efiboot_profile / "loader/entries"
+
+        if not loader_conf.exists():
+            die(f"Missing '{loader_conf}' for uefi.systemd-boot.")
+        if not entries_dir.is_dir():
+            die(f"Missing '{entries_dir}' for uefi.systemd-boot.")
+
+        # Prepare loader config in work dir
+        loader_work   = self.work_dir / "loader"
+        entries_work  = loader_work / "entries"
+        entries_work.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(loader_conf, loader_work)
+
+        for conf in entries_dir.glob("*.conf"):
+            (entries_work / conf.name).write_text(
+                self._substitute(conf.read_text())
+            )
+
+        # Calculate EFI image size
+        sd_efi = self.pacstrap_dir / "usr/lib/systemd/boot/efi/systemd-bootx64.efi"
+        if not sd_efi.exists():
+            die("systemd-boot EFI binary not found in chroot. Is 'systemd' installed?")
+
+        efi_files = [sd_efi, loader_work]
+        efi_files += list((self.pacstrap_dir / "boot").glob("vmlinuz-*"))
+        efi_files += list((self.pacstrap_dir / "boot").glob("initramfs-*.img"))
+        if self.need_external_ucodes:
+            for ucode in UCODES:
+                p = self.pacstrap_dir / "boot" / ucode
+                if p.exists():
+                    efi_files.append(p)
+
+        self._make_efi_img(efi_files)
+
+        # Copy systemd-boot EFI binary
+        efi_boot_iso = self.isofs_dir / "EFI/BOOT"
+        efi_boot_iso.mkdir(parents=True, exist_ok=True)
+        run(["mcopy", "-i", str(self.efibootimg),
+             str(sd_efi), "::/EFI/BOOT/BOOTX64.EFI"])
+        shutil.copy2(sd_efi, efi_boot_iso / "BOOTX64.EFI")
+
+        # Copy loader config to FAT image and ISO tree
+        run(["mcopy", "-i", str(self.efibootimg), "-s",
+             str(loader_work), "::/"])
+        shutil.copytree(loader_work, self.isofs_dir / "loader",
+                        dirs_exist_ok=True)
+
+        # Kernel + initramfs into FAT image
+        self._copy_boot_to_fat()
+
+        # Optional edk2 shell
+        edk2 = self.pacstrap_dir / "usr/share/edk2-shell/x64/Shell_Full.efi"
+        if edk2.exists():
+            run(["mcopy", "-i", str(self.efibootimg),
+                 str(edk2), "::/shellx64.efi"])
+            shutil.copy2(edk2, self.isofs_dir / "shellx64.efi")
+
+        # Optional memtest86+ EFI
+        memtest_efi = self.pacstrap_dir / "boot/memtest86+/memtest.efi"
+        if memtest_efi.exists():
+            mt_dest = self.isofs_dir / "boot/memtest86+"
+            mt_dest.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(memtest_efi, mt_dest / "memtest.efi")
+
+        info("Done! systemd-boot set up for UEFI booting.")
+
+    # --- uefi.grub ---
+
+    def _boot_uefi_grub(self):
+        info("Setting up GRUB for UEFI booting...")
+
+        grub_profile = self.profile / "grub"
+        if not grub_profile.is_dir() or not (grub_profile / "grub.cfg").exists():
+            die("Profile grub/grub.cfg missing for uefi.grub boot mode.")
+
+        grub_work = self.work_dir / "grub"
+        grub_work.mkdir(exist_ok=True)
+
+        # Process grub .cfg files
+        for cfg in grub_profile.glob("*.cfg"):
+            (grub_work / cfg.name).write_text(
+                self._substitute(cfg.read_text())
+            )
+
+        # Embedded config (searched first by GRUB to find the ISO volume)
+        embed_cfg = self.work_dir / "grub-embed.cfg"
+        embed_cfg.write_text(self._grub_embed_cfg())
+
+        # grubenv
+        (grub_work / "grubenv").write_text(self._grubenv_block())
+
+        # Build standalone GRUB EFI binary
+        grub_modules = " ".join([
+            "all_video", "at_keyboard", "boot", "btrfs", "cat", "chain",
+            "configfile", "echo", "efifwsetup", "efinet", "exfat", "ext2",
+            "f2fs", "fat", "font", "gfxmenu", "gfxterm", "gzio", "halt",
+            "hfsplus", "iso9660", "jpeg", "keylayouts", "linux", "loadenv",
+            "loopback", "lsefi", "lsefimmap", "minicmd", "normal", "ntfs",
+            "ntfscomp", "part_apple", "part_gpt", "part_msdos", "png",
+            "read", "reboot", "regexp", "search", "search_fs_file",
+            "search_fs_uuid", "search_label", "serial", "sleep", "tpm",
+            "udf", "usb", "usbserial_common", "usbserial_ftdi",
+            "usbserial_pl2303", "usbserial_usbdebug", "video", "xfs", "zstd",
+        ])
+
+        efi_binary = self.work_dir / "BOOTX64.EFI"
+        run([
+            "grub-mkstandalone",
+            "-O", "x86_64-efi",
+            f"--modules={grub_modules}",
+            "--locales=en@quot",
+            "--themes=",
+            "--sbat=/usr/share/grub/sbat.csv",
+            "--disable-shim-lock",
+            "-o", str(efi_binary),
+            f"boot/grub/grub.cfg={embed_cfg}",
+        ])
+
+        # EFI image
+        efi_files = [efi_binary]
+        edk2 = self.pacstrap_dir / "usr/share/edk2-shell/x64/Shell_Full.efi"
+        if edk2.exists():
+            efi_files.append(edk2)
+
+        self._make_efi_img(efi_files)
+
+        # Populate FAT image and ISO tree
+        efi_boot_iso = self.isofs_dir / "EFI/BOOT"
+        efi_boot_iso.mkdir(parents=True, exist_ok=True)
+        run(["mcopy", "-i", str(self.efibootimg),
+             str(efi_binary), "::/EFI/BOOT/BOOTX64.EFI"])
+        shutil.copy2(efi_binary, efi_boot_iso / "BOOTX64.EFI")
+
+        # Copy grub configs to ISO tree
+        grub_iso = self.isofs_dir / "boot/grub"
+        grub_iso.mkdir(parents=True, exist_ok=True)
+        for f in grub_work.iterdir():
+            shutil.copy2(f, grub_iso)
+        # Also copy any non-.cfg assets from the profile grub dir
+        for f in grub_profile.iterdir():
+            if not f.suffix == ".cfg":
+                shutil.copy2(f, grub_iso)
+
+        if edk2.exists():
+            run(["mcopy", "-i", str(self.efibootimg),
+                 str(edk2), "::/shellx64.efi"])
+            shutil.copy2(edk2, self.isofs_dir / "shellx64.efi")
+
+        info("Done! GRUB set up for UEFI booting.")
+
+    # ------------------------------------------------------------------
+    # FAT EFI image
+    # ------------------------------------------------------------------
+
+    def _make_efi_img(self, efi_files):
+        """Create efiboot.img sized to hold efi_files plus an 8 MiB buffer."""
+        r = run(
+            ["du", "-bcs", "--"]
+            + [str(f) for f in efi_files if Path(f).exists()],
+            capture=True, check=False
+        )
+        total_bytes = 0
+        if r.stdout:
+            try:
+                total_bytes = int(r.stdout.splitlines()[-1].split()[0])
+            except (IndexError, ValueError):
+                pass
+
+        size_kib = math.ceil((total_bytes / 1024 + 8192) / 1024) * 1024
+
+        self.efibootimg.unlink(missing_ok=True)
+        info(f"Creating EFI FAT image ({size_kib // 1024} MiB)...")
+
+        mkfs_opts = ["-C", "-n", "ARCHISO_EFI"]
+        if size_kib >= 36864:
+            mkfs_opts += ["-F", "32"]
+        run(["mkfs.fat"] + mkfs_opts + [str(self.efibootimg), str(size_kib)])
+        run(["mmd", "-i", str(self.efibootimg), "::/EFI", "::/EFI/BOOT"])
+
+    def _copy_boot_to_fat(self):
+        """Copy kernel and initramfs into the FAT image for systemd-boot."""
+        info("Copying kernel and initramfs to EFI FAT image...")
+        run(["mmd", "-i", str(self.efibootimg),
+             f"::/{ self.install_dir}",
+             f"::/{ self.install_dir}/boot",
+             f"::/{ self.install_dir}/boot/{self.arch}"])
+        boot_src = self.pacstrap_dir / "boot"
+        for pattern in ("vmlinuz-*", "initramfs-*.img"):
+            for f in boot_src.glob(pattern):
+                run(["mcopy", "-i", str(self.efibootimg),
+                     str(f), f"::/{ self.install_dir}/boot/{self.arch}/"])
+        info("Done!")
+
+    # ------------------------------------------------------------------
+    # Stage: cleanup pacstrap dir
+    # ------------------------------------------------------------------
+
+    def _cleanup_pacstrap_dir(self):
+        info("Cleaning up pacstrap directory...")
+
+        # Remove initramfs from squashfs — rebuilt by mkinitcpio during install.
+        # Kernel (vmlinuz-*) and ucode images stay: the installer needs them.
+        boot = self.pacstrap_dir / "boot"
+        for initrd in boot.glob("initramfs-*.img"):
+            info(f"  removing {initrd.name} from squashfs (rebuilt at install time)")
+            initrd.unlink()
+
+        for path in (
+            self.pacstrap_dir / "var/lib/pacman",
+            self.pacstrap_dir / "var/cache/pacman/pkg",
+            self.pacstrap_dir / "var/log",
+            self.pacstrap_dir / "var/tmp",
+        ):
+            if path.is_dir():
+                for item in path.iterdir():
+                    if item.is_file() or item.is_symlink():
+                        item.unlink()
+
+        # Remove pacman sync cache entirely
+        sync = self.pacstrap_dir / "var/lib/pacman/sync"
+        if sync.exists():
+            shutil.rmtree(sync)
+
+        # Remove pacman leftover files
+        for pattern in ("*.pacnew", "*.pacsave", "*.pacorig"):
+            for f in self.work_dir.rglob(pattern):
+                f.unlink(missing_ok=True)
+
+        # machine-id must be 'uninitialized' on first boot
+        machine_id = self.pacstrap_dir / "etc/machine-id"
+        machine_id.unlink(missing_ok=True)
+        machine_id.write_text("uninitialized\n")
+
+        info("Done!")
+
+    # ------------------------------------------------------------------
+    # Stage: squashfs
+    # ------------------------------------------------------------------
+
+    def _make_squashfs(self):
+        if not self.pacstrap_dir.exists():
+            die(f"pacstrap directory '{self.pacstrap_dir}' does not exist.")
+
+        info("Creating SquashFS image (this may take a while)...")
+        sfs_dir = self.isofs_dir / self.install_dir / self.arch
+        sfs_dir.mkdir(parents=True, exist_ok=True)
+        image_path = sfs_dir / "airootfs.sfs"
+        image_path.unlink(missing_ok=True)
+
+        cmd = ["mksquashfs", str(self.pacstrap_dir), str(image_path), "-noappend"]
+        cmd += self.sfs_tool_opts
+        if not self.verbose:
+            cmd += ["-no-progress", "-quiet"]
+        run(cmd)
+
+        info("Creating checksum file...")
+        r = run(
+            ["sha512sum", "airootfs.sfs"],
+            capture=True, cwd=str(sfs_dir)
+        )
+        (sfs_dir / "airootfs.sha512").write_text(r.stdout)
+
+        info("Done!")
+
+    # ------------------------------------------------------------------
+    # Stage: ISO image via xorriso
+    # ------------------------------------------------------------------
+
+    def _build_iso_image(self):
+        image_path = self.out_dir / self.image_name
+        image_path.unlink(missing_ok=True)
+
+        opts = [
+            "-iso-level", "3",
+            "-full-iso9660-filenames",
+            "-joliet", "-joliet-long",
+            "-rational-rock",
+            "-volid",     self.iso_label,
+            "-appid",     self.iso_application,
+            "-publisher", self.iso_publisher,
+            "-preparer",  f"prepared by {APP_NAME}",
+        ]
+
+        # Accumulate per-boot-mode xorriso options
+        partition_offset_added = False
+        for mode in self.bootmodes:
+            method_name = "_xorr_" + mode.replace(".", "_").replace("-", "_")
+            method = getattr(self, method_name, None)
+            if method:
+                mode_opts = method(partition_offset_added)
+                if "-partition_offset" in mode_opts:
+                    partition_offset_added = True
+                opts += mode_opts
+
+        # Drop CD padding when image > 900 MiB
+        r = run(
+            ["du", "-s", "--apparent-size", "-BM", f"{self.isofs_dir}/"],
+            capture=True, check=False
+        )
+        if r.stdout:
+            try:
+                size_mib = int(r.stdout.split("M")[0])
+                if size_mib > 900:
+                    opts.append("-no-pad")
+            except ValueError:
+                pass
+
+        info(f"Creating ISO image '{image_path}'...")
+        run(
+            ["xorriso", "-no_rc", "-as", "mkisofs"]
+            + opts
+            + ["-output", str(image_path), f"{self.isofs_dir}/"]
+        )
+
+        r = run(["du", "-h", str(image_path)], capture=True, check=False)
+        info(f"Done! {r.stdout.strip()}")
+
+    # xorriso option builders per boot mode
+
+    def _xorr_bios_syslinux(self, offset_added):
+        isohdpfx = self.isofs_dir / "boot/syslinux/isohdpfx.bin"
+        return [
+            "-eltorito-boot",    "boot/syslinux/isolinux.bin",
+            "-eltorito-catalog", "boot/syslinux/boot.cat",
+            "-no-emul-boot",
+            "-boot-load-size", "4",
+            "-boot-info-table",
+            "-isohybrid-mbr", str(isohdpfx),
+            "--mbr-force-bootable",
+            "-partition_offset", "16",
+        ]
+
+    def _xorr_uefi_systemd_boot(self, offset_added):
+        return self._common_uefi_xorr_opts(offset_added)
+
+    def _xorr_uefi_grub(self, offset_added):
+        return self._common_uefi_xorr_opts(offset_added)
+
+    def _common_uefi_xorr_opts(self, offset_added):
+        opts = []
+        if not offset_added:
+            opts += ["-partition_offset", "16"]
+
+        opts += [
+            "-append_partition", "2",
+            "C12A7328-F81F-11D2-BA4B-00A0C93EC93B",
+            str(self.efibootimg),
+        ]
+
+        has_bios = any(m.startswith("bios.") for m in self.bootmodes)
+        if has_bios:
+            # Alongside syslinux isohybrid we use an invalid-but-working GPT
+            opts.append("-isohybrid-gpt-basdat")
+        else:
+            opts.append("-appended_part_as_gpt")
+
+        opts += [
+            "-eltorito-alt-boot",
+            "-e", "--interval:appended_partition_2:all::",
+            "-no-emul-boot",
+        ]
+
+        if not has_bios:
+            opts += ["-eltorito-catalog", "EFI/boot.cat"]
+
+        return opts
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _substitute(self, text: str) -> str:
+        """Replace archiso placeholder tokens in config file text."""
+        replacements = {
+            "%ARCHISO_LABEL%":           self.iso_label,
+            "%ARCHISO_UUID%":            self.iso_uuid,
+            "%INSTALL_DIR%":             self.install_dir,
+            "%ARCH%":                    self.arch,
+            "%ARCHISO_SEARCH_FILENAME%": self.search_filename,
+        }
+        for token, value in replacements.items():
+            text = text.replace(token, value)
+        return text
+
+    def _grub_embed_cfg(self) -> str:
+        """
+        Generate the GRUB config embedded inside the EFI binary.
+        Its only job is to find the ISO volume and load the real grub.cfg from it.
+        """
+        sf = self.search_filename
+        return (
+            "if ! [ -d \"$cmdpath\" ]; then\n"
+            "    if regexp --set=1:archiso_bootdevice"
+            " '^\\(([^)]+)\\)\\/?[Ee][Ff][Ii]\\/[Bb][Oo][Oo][Tt]\\/?$'"
+            " \"${cmdpath}\"; then\n"
+            "        set cmdpath=\"(${archiso_bootdevice})/EFI/BOOT\"\n"
+            "        set ARCHISO_HINT=\"${archiso_bootdevice}\"\n"
+            "    fi\n"
+            "fi\n"
+            "if [ -z \"${ARCHISO_HINT}\" ]; then\n"
+            "    regexp --set=1:ARCHISO_HINT '^\\(([^)]+)\\)' \"${cmdpath}\"\n"
+            "fi\n"
+            f"if search --no-floppy --set=archiso_device --file '{sf}'"
+            " --hint \"${ARCHISO_HINT}\"; then\n"
+            "    set ARCHISO_HINT=\"${archiso_device}\"\n"
+            "    if probe --set ARCHISO_UUID --fs-uuid \"${ARCHISO_HINT}\"; then\n"
+            "        export ARCHISO_UUID\n"
+            "    fi\n"
+            "else\n"
+            f"    echo \"Could not find a volume with a '{sf}' file on it!\"\n"
+            "fi\n"
+            "if [ \"${ARCHISO_HINT}\" == 'memdisk' -o -z \"${ARCHISO_HINT}\" ]; then\n"
+            "    echo 'Could not find the ISO volume!'\n"
+            "elif [ -e \"(${ARCHISO_HINT})/boot/grub/grub.cfg\" ]; then\n"
+            "    export ARCHISO_HINT\n"
+            "    set root=\"${ARCHISO_HINT}\"\n"
+            "    configfile \"(${ARCHISO_HINT})/boot/grub/grub.cfg\"\n"
+            "else\n"
+            "    echo \"File '(${ARCHISO_HINT})/boot/grub/grub.cfg' not found!\"\n"
+            "fi\n"
+        )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description=(
+            "ArchBang/FruitBang ISO builder.\n"
+            "Run from inside the ISO profile directory (where profiledef.sh lives)."
+        ),
+    )
+    # Profile defaults to cwd — matches how the original build script works
+    parser.add_argument("profile", nargs="?", default=".",
+                        help="Profile directory [default: current directory]")
+    parser.add_argument("-w", "--work-dir", default="./work", metavar="DIR",
+                        help="Working directory [default: ./work]")
+    parser.add_argument("-o", "--out-dir",  default="./out",  metavar="DIR",
+                        help="Output directory  [default: ./out]")
+    parser.add_argument("-v", "--verbose",  action="store_true",
+                        help="Verbose output")
+    parser.add_argument("-r", "--rm-work-dir", action="store_true",
+                        help="Remove working directory after a successful build")
+
+    args = parser.parse_args()
+
+    builder = ISOBuilder(
+        profile     = args.profile,
+        work_dir    = args.work_dir,
+        out_dir     = args.out_dir,
+        verbose     = args.verbose,
+        rm_work_dir = args.rm_work_dir,
+    )
+    builder.build()
+
+
+if __name__ == "__main__":
+    main()
