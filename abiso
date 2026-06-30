@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mkbang — ArchBang/FruitBang ISO builder
+abiso — ArchBang/FruitBang ISO builder
 Replaces mkarchiso for the ArchBang/FruitBang use case.
 
 Supported boot modes: bios.syslinux, uefi.systemd-boot, uefi.grub
@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-APP_NAME = "mkbang"
+APP_NAME = "abiso"
 
 # Microcode images to carry alongside the initramfs when needed
 UCODES = [
@@ -62,7 +62,10 @@ def run(cmd, check=True, capture=False, cwd=None, extra_env=None):
         kwargs.update(capture_output=True, text=True)
     result = subprocess.run([str(c) for c in cmd], **kwargs)
     if check and result.returncode != 0:
-        die(f"Command failed (exit {result.returncode}): {' '.join(str(c) for c in cmd)}")
+        msg = f"Command failed (exit {result.returncode}): {' '.join(str(c) for c in cmd)}"
+        if capture and result.stderr:
+            msg += f"\n--- stderr ---\n{result.stderr.rstrip()}"
+        die(msg)
     return result
 
 
@@ -176,7 +179,7 @@ class ISOBuilder:
         profile=".",
         work_dir="./work",
         out_dir="./out",
-        verbose=True,
+        verbose=False,
         rm_work_dir=False,
     ):
         self.profile    = Path(profile).resolve()
@@ -245,8 +248,8 @@ class ISOBuilder:
             self._show_config()
 
         self._once("make_pacman_conf",       self._make_pacman_conf)
-        self._once("make_custom_airootfs",   self._make_custom_airootfs)
         self._once("make_packages",          self._make_packages)
+        self._once("make_custom_airootfs",   self._make_custom_airootfs)
         self._once("make_version",           self._make_version)
         self._once("make_customize_airootfs",self._make_customize_airootfs)
         self._once("make_pkglist",           self._make_pkglist)
@@ -733,8 +736,13 @@ class ISOBuilder:
             shutil.copy2(f, grub_iso)
         # Also copy any non-.cfg assets from the profile grub dir
         for f in grub_profile.iterdir():
-            if not f.suffix == ".cfg":
-                shutil.copy2(f, grub_iso)
+            if f.suffix == ".cfg":
+                continue
+            dest = grub_iso / f.name
+            if f.is_dir():
+                shutil.copytree(f, dest, dirs_exist_ok=True)
+            else:
+                shutil.copy2(f, dest)
 
         if edk2.exists():
             run(["mcopy", "-i", str(self.efibootimg),
@@ -818,7 +826,7 @@ class ISOBuilder:
 
         # Remove pacman leftover files
         for pattern in ("*.pacnew", "*.pacsave", "*.pacorig"):
-            for f in self.work_dir.rglob(pattern):
+            for f in self.pacstrap_dir.rglob(pattern):
                 f.unlink(missing_ok=True)
 
         # machine-id must be 'uninitialized' on first boot
