@@ -53,7 +53,14 @@ def die(msg: str, code: int = 1) -> None:
 # ---------------------------------------------------------------------------
 
 def run(cmd, check=True, capture=False, cwd=None, extra_env=None):
-    """Run a command, optionally capturing output. Dies on failure."""
+    """Run a command, optionally capturing output. Dies on failure.
+
+    TMPDIR is stripped: build tools (mksquashfs, xorriso, mkfs.fat) are run
+    as root against work_dir-relative paths, and an inherited TMPDIR pointing
+    somewhere the invoking user controls (e.g. a small tmpfs $HOME/.cache)
+    could otherwise silently redirect large intermediate files there instead
+    of alongside work_dir.
+    """
     env = {k: v for k, v in os.environ.items() if k != "TMPDIR"}
     if extra_env:
         env.update(extra_env)
@@ -73,25 +80,34 @@ def run(cmd, check=True, capture=False, cwd=None, extra_env=None):
 # Profile reader
 # ---------------------------------------------------------------------------
 
+_SAFE_PATH_TOKEN = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
 def _read_profile(profile: Path) -> dict:
     """
     Source profiledef.sh via bash and extract all relevant variables,
     including bash arrays and associative arrays.
+
+    Every value is base64-encoded on its own line by the bash side, prefixed
+    with a count of how many lines to read. This means there is no sentinel
+    string (like a bare "__END__") that profile content could collide with,
+    and no risk of an embedded newline in a scalar value desyncing the parser.
     Returns a plain dict with everything normalised to Python types.
     """
     profiledef = profile / "profiledef.sh"
     if not profiledef.exists():
         die(f"Profile '{profile}' is missing profiledef.sh!")
 
-    # We emit each variable as a JSON fragment so we can parse it cleanly.
     dump_script = r"""
 source "{profiledef}"
+
+b64() { printf '%s' "$1" | base64 -w0; printf '\n'; }
 
 emit() {
     local key="$1"; shift
     printf '%s\n' "$key"
-    printf '%s\n' "$@"
-    printf '__END__\n'
+    printf '%s\n' "$#"
+    for v in "$@"; do b64 "$v"; done
 }
 
 emit iso_name         "${iso_name:-}"
@@ -106,11 +122,12 @@ emit airootfs_image_type "${airootfs_image_type:-squashfs}"
 emit bootmodes        "${bootmodes[@]:-}"
 emit airootfs_image_tool_options "${airootfs_image_tool_options[@]:-}"
 
-# File permissions — emit as key=value pairs
+printf '__FILEPERM__\n'
+printf '%s\n' "${#file_permissions[@]}"
 for k in "${!file_permissions[@]}"; do
-    printf 'FILEPERM\t%s\t%s\n' "$k" "${file_permissions[$k]}"
+    b64 "$k"
+    b64 "${file_permissions[$k]}"
 done
-printf 'FILEPERM_END\n'
 """.replace("{profiledef}", shlex.quote(str(profiledef)))
 
     result = run(
@@ -120,34 +137,47 @@ printf 'FILEPERM_END\n'
     if result.returncode != 0:
         die(f"Failed to source profiledef.sh:\n{result.stderr}")
 
+    import base64
+
     lines = result.stdout.splitlines()
     vars_ = {}
     i = 0
     while i < len(lines):
-        line = lines[i]
-
-        if line == "FILEPERM_END":
-            break
-
-        if line.startswith("FILEPERM\t"):
-            _, key, val = line.split("\t", 2)
-            vars_.setdefault("file_permissions", {})[key] = val
+        if lines[i] == "__FILEPERM__":
             i += 1
+            count = int(lines[i]); i += 1
+            fp = {}
+            for _ in range(count):
+                k = base64.b64decode(lines[i]).decode(errors="replace"); i += 1
+                v = base64.b64decode(lines[i]).decode(errors="replace"); i += 1
+                fp[k] = v
+            vars_["file_permissions"] = fp
             continue
 
-        # key line followed by values until __END__
-        key = line
-        values = []
-        i += 1
-        while i < len(lines) and lines[i] != "__END__":
-            values.append(lines[i])
-            i += 1
-        i += 1  # skip __END__
+        key = lines[i]; i += 1
+        count = int(lines[i]); i += 1
+        values = [base64.b64decode(lines[i + j]).decode(errors="replace") for j in range(count)]
+        i += count
 
         if key in ("bootmodes", "airootfs_image_tool_options"):
-            vars_[key] = " ".join(values).split() if values else []
+            vars_[key] = [v for v in values if v]
         else:
             vars_[key] = values[0] if values else ""
+
+    # The bash side always emits these keys (with an empty-string default),
+    # so the key is never actually MISSING from vars_ — a plain
+    # vars_.setdefault(...) below would never fire. Check falsiness instead.
+    for key, default in (
+        ("arch", "x86_64"),
+        ("install_dir", APP_NAME),
+        ("airootfs_image_type", "squashfs"),
+    ):
+        if not vars_.get(key):
+            vars_[key] = default
+    if not vars_.get("bootmodes"):
+        vars_["bootmodes"] = ["bios.syslinux", "uefi.systemd-boot"]
+    vars_.setdefault("airootfs_image_tool_options", [])
+    vars_.setdefault("file_permissions", {})
 
     # Resolve pacman_conf path relative to the profile directory
     raw_conf = vars_.get("pacman_conf", "")
@@ -159,12 +189,16 @@ printf 'FILEPERM_END\n'
     else:
         vars_["pacman_conf"] = "/etc/pacman.conf"
 
-    vars_.setdefault("arch", "x86_64")
-    vars_.setdefault("install_dir", APP_NAME)
-    vars_.setdefault("airootfs_image_type", "squashfs")
-    vars_.setdefault("bootmodes", ["bios.syslinux", "uefi.systemd-boot"])
-    vars_.setdefault("airootfs_image_tool_options", [])
-    vars_.setdefault("file_permissions", {})
+    # arch/install_dir/iso_* feed directly into filesystem paths throughout
+    # the build (pacstrap_dir, isofs_dir subpaths, the final image name) —
+    # reject '/' or '..' so a malformed profiledef.sh can't redirect a
+    # root-run build outside work_dir/out_dir.
+    for key in ("arch", "install_dir", "iso_name", "iso_version", "iso_label"):
+        value = vars_.get(key, "")
+        if value and not _SAFE_PATH_TOKEN.match(value):
+            die(f"profiledef.sh: '{key}' contains characters other than "
+                f"letters/digits/._- ('{value}') — refusing, since this "
+                "value is used to build filesystem paths.")
 
     return vars_
 
@@ -243,6 +277,20 @@ class ISOBuilder:
             build_date_file.write_text(str(self.source_date_epoch) + "\n")
         else:
             self.source_date_epoch = int(build_date_file.read_text().strip())
+            # iso_uuid/search_filename were computed in __init__ from the
+            # epoch picked BEFORE this reload — if this run picked a
+            # different epoch than the original run (no SOURCE_DATE_EPOCH
+            # pinned), a resumed boot-mode stage would embed a UUID/search
+            # file that doesn't match what an earlier, already-stamped stage
+            # wrote to the ISO tree, and GRUB fails to find the volume.
+            # Recompute from the reloaded epoch so every stage this run uses
+            # values consistent with whatever's already on disk.
+            self.iso_uuid = time.strftime(
+                "%F-%H-%M-%S-00", time.gmtime(self.source_date_epoch)
+            )
+            self.search_filename = f"/boot/{self.iso_uuid}.uuid"
+
+        self._warn_if_resume_stale()
 
         if self.verbose:
             self._show_config()
@@ -277,6 +325,29 @@ class ISOBuilder:
             stamp.touch()
         else:
             info(f"Skipping '{name}' (already done).")
+
+    def _warn_if_resume_stale(self):
+        """Stamps only check existence, not content — if profiledef.sh or the
+        packages file changed since the oldest stamp in this work_dir, a
+        resumed build will silently skip re-running the stage that would
+        have picked up the change."""
+        stamps = list(self.work_dir.glob("base.*"))
+        if not stamps:
+            return
+        oldest_stamp = min(s.stat().st_mtime for s in stamps)
+
+        sources = [self.profile / "profiledef.sh"]
+        pkg_file = self.profile / f"packages.{self.arch}"
+        if not pkg_file.exists():
+            pkg_file = self.profile / "packages"
+        sources.append(pkg_file)
+
+        for src in sources:
+            if src.exists() and src.stat().st_mtime > oldest_stamp:
+                warning(f"'{src}' changed since this build in '{self.work_dir}' "
+                        "started — resumed stages will NOT pick up the change. "
+                        "Remove work_dir (or the specific base.* stamp) to force "
+                        "a full rebuild.")
 
     # ------------------------------------------------------------------
     # Config display
@@ -323,10 +394,18 @@ class ISOBuilder:
             )
 
         hook_dir = self.pacstrap_dir / "etc/pacman.d/hooks"
-        conf = conf.replace(
-            "[options]",
-            f"[options]\nCacheDir = {sys_cache}\nHookDir = {hook_dir}"
-        )
+        injected = f"[options]\nCacheDir = {sys_cache}\nHookDir = {hook_dir}"
+        count = conf.count("[options]")
+        if count == 0:
+            # No [options] section to anchor on — append one rather than
+            # silently dropping CacheDir/HookDir (pacman would otherwise
+            # fall back to its own system defaults inside the chroot).
+            conf = conf.rstrip("\n") + "\n\n" + injected + "\n"
+        elif count == 1:
+            conf = conf.replace("[options]", injected)
+        else:
+            die(f"'{self.pacman_conf}' has {count} '[options]' sections — "
+                "cannot determine which one to inject CacheDir/HookDir into.")
 
         self.work_pacman_conf.write_text(conf)
         info(f"Written to {self.work_pacman_conf}")
@@ -354,7 +433,15 @@ class ISOBuilder:
                 warning(f"Malformed permission entry '{filename}': {perms}")
                 continue
             owner, group, mode = parts
-            target = self.pacstrap_dir / filename.lstrip("/")
+            target = (self.pacstrap_dir / filename.lstrip("/")).resolve()
+
+            # filename comes straight from profiledef.sh — reject anything
+            # that resolves outside pacstrap_dir (e.g. via '../..') before
+            # chown/chmod run as root on it.
+            if not target.is_relative_to(self.pacstrap_dir.resolve()):
+                warning(f"file_permissions entry '{filename}' resolves outside "
+                        f"the airootfs ('{target}') — skipped.")
+                continue
 
             if not target.exists():
                 warning(f"Cannot set permissions on '{target}': does not exist.")
@@ -418,7 +505,7 @@ class ISOBuilder:
         (iso_id / "version").write_text(self.iso_version + "\n")
 
         # grubenv on ISO 9660
-        (iso_id / "grubenv").write_text(self._grubenv_block())
+        (iso_id / "grubenv").write_bytes(self._grubenv_block())
 
         # GRUB search file (GRUB looks for this to locate the ISO volume)
         search_path = self.isofs_dir / self.search_filename.lstrip("/")
@@ -446,8 +533,14 @@ class ISOBuilder:
 
         info("Done!")
 
-    def _grubenv_block(self) -> str:
-        """Generate a padded 1024-byte GRUB environment block."""
+    def _grubenv_block(self) -> bytes:
+        """Generate a padded 1024-byte GRUB environment block.
+
+        GRUB reads this as a fixed-size 1024-BYTE block, so padding must be
+        computed on the UTF-8 byte length, not Python's str length (code
+        points) — any non-ASCII character in iso_name/version/label would
+        otherwise under-pad and produce a corrupt block.
+        """
         content = (
             "# GRUB Environment Block\n"
             f"NAME={self.iso_name}\n"
@@ -456,11 +549,10 @@ class ISOBuilder:
             f"INSTALL_DIR={self.install_dir}\n"
             f"ARCH={self.arch}\n"
             f"ARCHISO_SEARCH_FILENAME={self.search_filename}\n"
-        )
+        ).encode("utf-8")
         if len(content) > 1024:
             raise ValueError(f"grubenv content exceeds 1024 bytes ({len(content)}); shorten iso_name/version/label")
-        padding = "#" * (1024 - len(content))
-        return content + padding
+        return content + b"#" * (1024 - len(content))
 
     # ------------------------------------------------------------------
     # Stage: customize_airootfs
@@ -542,6 +634,11 @@ class ISOBuilder:
     # ------------------------------------------------------------------
 
     def _make_bootmodes(self):
+        uefi_modes = [m for m in self.bootmodes if m.startswith("uefi.")]
+        if len(uefi_modes) > 1:
+            die(f"Only one uefi.* boot mode may be active at a time (got: "
+                f"{', '.join(uefi_modes)}) — they all write the same "
+                "efiboot.img and would silently clobber each other.")
         for mode in self.bootmodes:
             method_name = "_boot_" + mode.replace(".", "_").replace("-", "_")
             method = getattr(self, method_name, None)
@@ -685,7 +782,7 @@ class ISOBuilder:
         embed_cfg.write_text(self._grub_embed_cfg())
 
         # grubenv
-        (grub_work / "grubenv").write_text(self._grubenv_block())
+        (grub_work / "grubenv").write_bytes(self._grubenv_block())
 
         # Build standalone GRUB EFI binary
         grub_modules = " ".join([
@@ -767,7 +864,8 @@ class ISOBuilder:
             try:
                 total_bytes = int(r.stdout.splitlines()[-1].split()[0])
             except (IndexError, ValueError):
-                pass
+                warning(f"Could not parse 'du' output ({r.stdout!r}); "
+                        "sizing EFI image from an 8 MiB floor only.")
 
         size_kib = math.ceil((total_bytes / 1024 + 8192) / 1024) * 1024
 
@@ -884,9 +982,16 @@ class ISOBuilder:
             "-preparer",  f"prepared by {APP_NAME}",
         ]
 
+        # Assemble bios opts before uefi opts, regardless of the order
+        # bootmodes appear in profiledef.sh. xorriso's El Torito directives
+        # are order-sensitive: bios.syslinux establishes the primary boot
+        # catalog that -eltorito-alt-boot's UEFI secondary entry depends on,
+        # so bios must always be emitted first.
+        ordered_modes = sorted(self.bootmodes, key=lambda m: not m.startswith("bios."))
+
         # Accumulate per-boot-mode xorriso options
         partition_offset_added = False
-        for mode in self.bootmodes:
+        for mode in ordered_modes:
             method_name = "_xorr_" + mode.replace(".", "_").replace("-", "_")
             method = getattr(self, method_name, None)
             if method:
@@ -906,7 +1011,8 @@ class ISOBuilder:
                 if size_mib > 900:
                     opts.append("-no-pad")
             except ValueError:
-                pass
+                warning(f"Could not parse 'du' output ({r.stdout!r}); "
+                        "CD padding will be applied even if unnecessary.")
 
         info(f"Creating ISO image '{image_path}'...")
         run(
@@ -922,7 +1028,7 @@ class ISOBuilder:
 
     def _xorr_bios_syslinux(self, offset_added):
         isohdpfx = self.isofs_dir / "boot/syslinux/isohdpfx.bin"
-        return [
+        opts = [
             "-eltorito-boot",    "boot/syslinux/isolinux.bin",
             "-eltorito-catalog", "boot/syslinux/boot.cat",
             "-no-emul-boot",
@@ -930,8 +1036,10 @@ class ISOBuilder:
             "-boot-info-table",
             "-isohybrid-mbr", str(isohdpfx),
             "--mbr-force-bootable",
-            "-partition_offset", "16",
         ]
+        if not offset_added:
+            opts += ["-partition_offset", "16"]
+        return opts
 
     def _xorr_uefi_systemd_boot(self, offset_added):
         return self._common_uefi_xorr_opts(offset_added)
