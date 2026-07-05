@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-abiso — ArchBang/FruitBang ISO builder
-Replaces mkarchiso for the ArchBang/FruitBang use case.
+abiso — ArchBang ISO builder
+Replaces mkarchiso for the ArchBang use case.
 
 Supported boot modes: bios.syslinux, uefi.systemd-boot, uefi.grub
 Rootfs image type:    squashfs only
@@ -1140,7 +1140,7 @@ def main():
     parser = argparse.ArgumentParser(
         prog=APP_NAME,
         description=(
-            "ArchBang/FruitBang ISO builder.\n"
+            "ArchBang ISO builder.\n"
             "Run from inside the ISO profile directory (where profiledef.sh lives)."
         ),
     )
